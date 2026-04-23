@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! Database utilities for path processing and connection management
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Process database path argument according to semcode's database location rules
 ///
@@ -11,9 +11,10 @@ use std::path::Path;
 ///    - Otherwise, use the path as-is (direct database path)
 /// 2. If `database_arg` is None, check the `SEMCODE_DB` environment variable
 ///    (same directory/suffix semantics as the `-d` flag)
-/// 3. If neither is set:
-///    - For indexing operations: prefer `source_dir/.semcode.db`, fallback to current directory
-///    - For query operations: use current directory `./.semcode.db`
+/// 3. If neither is set, resolve from `source_dir` (indexing) or `.` (queries):
+///    - Use `dir/.semcode.db` if it exists locally
+///    - Try git-aware discovery (repo root, then main repo for linked worktrees)
+///    - Fall back to `dir/.semcode.db`
 ///
 /// # Arguments
 /// * `database_arg` - Optional database path from command line (-d flag)
@@ -34,23 +35,79 @@ pub fn process_database_path(database_arg: Option<&str>, source_dir: Option<&Pat
                 }
             }
 
-            match source_dir {
-                Some(source_path) => {
-                    // For indexing operations: prefer source directory unless it's current directory
-                    let source_semcode_db = source_path.join(".semcode.db");
-                    if source_path != Path::new(".") {
-                        source_semcode_db.to_string_lossy().to_string()
-                    } else {
-                        // Source is current directory, use current directory
-                        "./.semcode.db".to_string()
-                    }
-                }
-                None => {
-                    // For query operations: use current directory
-                    "./.semcode.db".to_string()
-                }
-            }
+            let start = source_dir.unwrap_or(Path::new("."));
+            resolve_db_for_dir(start)
         }
+    }
+}
+
+/// Resolve `.semcode.db` for a given starting directory.
+///
+/// Checks (in order):
+/// 1. `dir/.semcode.db` if it exists locally
+/// 2. Existing `.semcode.db` at the git repo root or main repo (for worktrees)
+/// 3. The git repo root as the default creation location (prefers main repo for worktrees)
+/// 4. Falls back to `dir/.semcode.db`
+fn resolve_db_for_dir(dir: &Path) -> String {
+    let local = dir.join(".semcode.db");
+    if local.is_dir() {
+        return local.to_string_lossy().to_string();
+    }
+
+    if let Ok(repo) = gix::discover(dir) {
+        if let Some(found) = find_existing_db(&repo) {
+            return found;
+        }
+        return default_db_location(&repo).unwrap_or_else(|| local.to_string_lossy().to_string());
+    }
+
+    local.to_string_lossy().to_string()
+}
+
+/// Search for an existing `.semcode.db` via the git repository.
+///
+/// Checks the working directory first, then the main repo for linked worktrees.
+fn find_existing_db(repo: &gix::Repository) -> Option<String> {
+    let workdir = repo.workdir()?;
+    let candidate = workdir.join(".semcode.db");
+    if candidate.is_dir() {
+        return Some(candidate.to_string_lossy().to_string());
+    }
+
+    if let Some(main_workdir) = main_repo_workdir(repo) {
+        let candidate = main_workdir.join(".semcode.db");
+        if candidate.is_dir() {
+            return Some(candidate.to_string_lossy().to_string());
+        }
+    }
+
+    None
+}
+
+/// Return the best location to create a new `.semcode.db`.
+///
+/// For linked worktrees, prefers the main repo so all worktrees share one database.
+/// Otherwise uses the repo workdir.
+fn default_db_location(repo: &gix::Repository) -> Option<String> {
+    let target = main_repo_workdir(repo).or_else(|| repo.workdir().map(|p| p.to_path_buf()))?;
+    Some(target.join(".semcode.db").to_string_lossy().to_string())
+}
+
+/// For linked worktrees, resolve the main repository's working directory.
+/// Returns `None` if this is not a linked worktree or if the main repo is bare.
+fn main_repo_workdir(repo: &gix::Repository) -> Option<PathBuf> {
+    let common = repo.common_dir();
+    if common == repo.git_dir() {
+        return None;
+    }
+    let canonical = common.canonicalize().ok()?;
+    let main_workdir = canonical.parent()?;
+    // Verify this is actually a working directory (not a bare repo)
+    // by checking that .git exists as a child of the candidate.
+    if main_workdir.join(".git").exists() {
+        Some(main_workdir.to_path_buf())
+    } else {
+        None
     }
 }
 
@@ -187,5 +244,137 @@ mod tests {
             Some(v) => std::env::set_var("SEMCODE_DB", v),
             None => std::env::remove_var("SEMCODE_DB"),
         }
+    }
+
+    /// Helper: create a git repo with an initial commit.
+    fn init_git_repo(path: &std::path::Path) {
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+        std::fs::write(path.join("file.txt"), "hello\n").unwrap();
+        std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(path)
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["commit", "-m", "initial"])
+            .current_dir(path)
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@test.com")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@test.com")
+            .output()
+            .unwrap();
+    }
+
+    #[test]
+    fn test_git_discovery_at_repo_root() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let repo = tmpdir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_git_repo(&repo);
+
+        // No .semcode.db yet — should default to repo root
+        let result = resolve_db_for_dir(&repo);
+        assert!(result.ends_with(".semcode.db"));
+
+        // Create .semcode.db — should find it
+        std::fs::create_dir(repo.join(".semcode.db")).unwrap();
+        let result = resolve_db_for_dir(&repo);
+        assert!(result.ends_with(".semcode.db"));
+        assert!(result.contains(repo.to_str().unwrap()));
+    }
+
+    #[test]
+    fn test_git_discovery_from_subdirectory() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let repo = tmpdir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_git_repo(&repo);
+        std::fs::create_dir(repo.join(".semcode.db")).unwrap();
+
+        let subdir = repo.join("src").join("deep");
+        std::fs::create_dir_all(&subdir).unwrap();
+
+        let result = resolve_db_for_dir(&subdir);
+        assert!(result.ends_with(".semcode.db"));
+        assert!(result.contains(repo.to_str().unwrap()));
+    }
+
+    #[test]
+    fn test_git_discovery_worktree_finds_main_repo_db() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let main_repo = tmpdir.path().join("main");
+        std::fs::create_dir(&main_repo).unwrap();
+        init_git_repo(&main_repo);
+        std::fs::create_dir(main_repo.join(".semcode.db")).unwrap();
+
+        let wt_path = tmpdir.path().join("worktree");
+        let output = std::process::Command::new("git")
+            .args(["worktree", "add", "-d", wt_path.to_str().unwrap(), "HEAD"])
+            .current_dir(&main_repo)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git worktree add failed");
+
+        assert!(!wt_path.join(".semcode.db").exists());
+        let result = resolve_db_for_dir(&wt_path);
+        assert!(result.ends_with(".semcode.db"));
+        assert!(
+            result.contains(main_repo.to_str().unwrap()),
+            "should resolve to main repo's db, got: {result}"
+        );
+    }
+
+    #[test]
+    fn test_git_discovery_worktree_local_db_preferred() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let main_repo = tmpdir.path().join("main");
+        std::fs::create_dir(&main_repo).unwrap();
+        init_git_repo(&main_repo);
+        std::fs::create_dir(main_repo.join(".semcode.db")).unwrap();
+
+        let wt_path = tmpdir.path().join("worktree");
+        let output = std::process::Command::new("git")
+            .args(["worktree", "add", "-d", wt_path.to_str().unwrap(), "HEAD"])
+            .current_dir(&main_repo)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+
+        std::fs::create_dir(wt_path.join(".semcode.db")).unwrap();
+        let result = resolve_db_for_dir(&wt_path);
+        assert!(
+            result.contains(wt_path.to_str().unwrap()),
+            "should prefer worktree's own db, got: {result}"
+        );
+    }
+
+    #[test]
+    fn test_git_discovery_worktree_no_db_defaults_to_main_repo() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let main_repo = tmpdir.path().join("main");
+        std::fs::create_dir(&main_repo).unwrap();
+        init_git_repo(&main_repo);
+
+        let wt_path = tmpdir.path().join("worktree");
+        let output = std::process::Command::new("git")
+            .args(["worktree", "add", "-d", wt_path.to_str().unwrap(), "HEAD"])
+            .current_dir(&main_repo)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+
+        // No .semcode.db anywhere — should default to main repo, not worktree
+        assert!(!main_repo.join(".semcode.db").exists());
+        assert!(!wt_path.join(".semcode.db").exists());
+        let result = resolve_db_for_dir(&wt_path);
+        assert!(
+            result.contains(main_repo.to_str().unwrap()),
+            "should default to main repo location, got: {result}"
+        );
     }
 }
