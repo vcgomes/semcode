@@ -97,16 +97,11 @@ The git hooks are stored in the `hooks/` directory (tracked by git) and are shar
 
 Semcode uses the following search order to locate the `.semcode.db` database directory:
 
-**For semcode-index:**
+**For all tools** (semcode-index, semcode, semcode-mcp, semcode-lsp):
 1. **-d flag**: If provided, use the specified path (direct database path or parent directory containing `.semcode.db`)
 2. **SEMCODE_DB environment variable**: Same path semantics as `-d`
-3. **Source directory**: Look for `.semcode.db` in the source directory specified by `-s`
-4. **Current directory**: Fall back to `./.semcode.db` in the current working directory
-
-**For semcode (query tool), semcode-mcp, and semcode-lsp:**
-1. **-d flag / configuration**: If provided, use the specified path (direct database path or parent directory containing `.semcode.db`)
-2. **SEMCODE_DB environment variable**: Same path semantics as `-d`
-3. **Workspace/Current directory**: Use `./.semcode.db` in the workspace or current working directory
+3. **Local directory**: Use `.semcode.db` in the starting directory (source dir for indexing, current/workspace dir for queries) if it exists
+4. **Git-aware discovery**: Use gitoxide to find `.semcode.db` at the repository root; for linked worktrees, also checks the main repository's working directory
 
 The `-d` flag can specify either:
 - A direct path to the database directory (e.g., `./my-custom.db`)
